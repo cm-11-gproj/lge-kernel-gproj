@@ -5,8 +5,6 @@
 #include <linux/nfc/pn544_lge.h>
 // seokmin.hong@lge.com    header file added for removing depedency of platform and managing LGE modification
 #include "pn544_lge_hwadapter.h"
-#include <mach/board_lge.h>
-//130509 urim.kim@lge.com To know boot mode
 
 #ifdef CONFIG_LGE_NFC_MULTICORE_FASTBOOT
 #include <linux/kthread.h>
@@ -24,8 +22,6 @@ static bool cancle_read = false;//DY_TEST
 
 static int	stReadIntFlag;
 static struct i2c_client *pn544_client;
-static enum lge_boot_mode_type boot_mode;
-//130509 urim.kim@lge.com To know boot mode
 
 static void pn544_disable_irq(struct pn544_dev *pn544_dev)
 {
@@ -35,9 +31,9 @@ static void pn544_disable_irq(struct pn544_dev *pn544_dev)
 	if (pn544_dev->irq_enabled) {
 		disable_irq_nosync(pn544_get_irq_pin(pn544_dev));
 // 20120831, jh.heo@lge.com Fix to irq interrupt in sleep mode.
-//#if !defined(CONFIG_LGE_NFC_HW_QCT_MSM8660)&&!defined(CONFIG_LGE_NFC_HW_QCT_MSM8255)
-//		disable_irq_wake(pn544_get_irq_pin(pn544_dev));
-//#endif
+#if !defined(CONFIG_LGE_NFC_HW_QCT_MSM8660)&&!defined(CONFIG_LGE_NFC_HW_QCT_MSM8255)
+		disable_irq_wake(pn544_get_irq_pin(pn544_dev));
+#endif
 		pn544_dev->irq_enabled = false;
 	}
 	spin_unlock_irqrestore(&pn544_dev->irq_enabled_lock, flags);
@@ -169,7 +165,7 @@ static int __pn544_kread(void *dev, unsigned int length)
 #ifdef READ_IRQ_MODIFY
         do_reading=0;//DY_TEST
 #endif
-//        enable_irq_wake(pn544_get_irq_pin(pn544_dev));
+        enable_irq_wake(pn544_get_irq_pin(pn544_dev));
         enable_irq(pn544_get_irq_pin(pn544_dev));
 #ifdef READ_IRQ_MODIFY
         ret = wait_event_interruptible(pn544_dev->read_wq, do_reading);
@@ -278,9 +274,8 @@ static ssize_t pn544_dev_read(struct file *filp, char __user *buf,
 		size_t count, loff_t *offset)
 {
 	struct pn544_dev *pn544_dev = filp->private_data;
-	static char tmp[MAX_BUFFER_SIZE];
+	char tmp[MAX_BUFFER_SIZE];
 	int ret;
-	int irq_gpio_val = 0;
 
 	if (count > MAX_BUFFER_SIZE)
 		count = MAX_BUFFER_SIZE;
@@ -289,51 +284,38 @@ static ssize_t pn544_dev_read(struct file *filp, char __user *buf,
 
 	mutex_lock(&pn544_dev->read_mutex);
 
-	if (!stReadIntFlag) {
-		irq_gpio_val = gpio_get_value(pn544_dev->irq_gpio);
-		dprintk(PN544_DRV_NAME ":IRQ GPIO = %d\n", irq_gpio_val);
-		if (irq_gpio_val == 0) {
-			if (filp->f_flags & O_NONBLOCK) {
-				pr_err(PN544_DRV_NAME ":f_falg has O_NONBLOCK. EAGAIN!\n");
-				ret = -EAGAIN;
-				goto fail;
-			}
+	if (!gpio_get_value(pn544_dev->irq_gpio)) {
+		if (filp->f_flags & O_NONBLOCK) {
+			ret = -EAGAIN;
+			goto fail;
+		}
 
+		while (1) {
 			pn544_dev->irq_enabled = true;
-#ifdef LGE_NFC_READ_IRQ_MODIFY
-		do_reading=0;//DY_TEST
-#endif
-// 20120831, jh.heo@lge.com Fix to irq interrupt in sleep mode.
-//#if !defined(LGE_NFC_HW_QCT_MSM8660)
-//			enable_irq_wake(pn544_get_irq_pin(pn544_dev));
-//#endif
-			enable_irq(pn544_get_irq_pin(pn544_dev));
-#ifdef LGE_NFC_READ_IRQ_MODIFY
-		ret = wait_event_interruptible(pn544_dev->read_wq, do_reading);
-#else
-			ret = wait_event_interruptible(pn544_dev->read_wq,
-					gpio_get_value(pn544_dev->irq_gpio));
-#endif
+			enable_irq(pn544_dev->client->irq);
+			ret = wait_event_interruptible(
+					pn544_dev->read_wq,
+					!pn544_dev->irq_enabled);
+
 			pn544_disable_irq(pn544_dev);
-			//dprintk(PN544_DRV_NAME ":wait_event_interruptible : %d\n", ret);
-#ifdef LGE_NFC_READ_IRQ_MODIFY
-        //DY_TEST
-        if(cancle_read == true)
-        {
-            cancle_read = false;
-            ret = -1;
-            goto fail;
-        }
-#endif
+
 			if (ret)
 				goto fail;
+
+			if (gpio_get_value(pn544_dev->irq_gpio))
+				break;
+
+			pr_warning("%s: spurious interrupt detected\n", __func__);
 		}
 	}
 
 	/* Read data */
-	memset(tmp, 0x00, MAX_BUFFER_SIZE);
 	ret = i2c_master_recv(pn544_dev->client, tmp, count);
 	mutex_unlock(&pn544_dev->read_mutex);
+
+	/* pn544 seems to be slow in handling I2C read requests
+	 * so add 1ms delay after recv operation */
+	udelay(1000);
 
 	if (ret < 0) {
 		pr_err("%s: i2c_master_recv returned %d\n", __func__, ret);
@@ -368,7 +350,6 @@ static ssize_t pn544_dev_write(struct file *filp, const char __user *buf,
 	if (count > MAX_BUFFER_SIZE)
 		count = MAX_BUFFER_SIZE;
 
-	memset(tmp, 0x00, MAX_BUFFER_SIZE);
 	if (copy_from_user(tmp, buf, count)) {
 		pr_err(PN544_DRV_NAME ":%s : failed to copy from user space\n", __func__);
 		return -EFAULT;
@@ -383,6 +364,9 @@ static ssize_t pn544_dev_write(struct file *filp, const char __user *buf,
 		pr_err("%s : i2c_master_send returned %d\n", __func__, ret);
 		ret = -EIO;
 	}
+	/* pn544 seems to be slow in handling I2C read requests
+	 * so add 1ms delay after I2C operation */
+	udelay(1000);
 
 	return ret;
 }
@@ -395,7 +379,7 @@ static int pn544_dev_open(struct inode *inode, struct file *filp)
 	return 0;
 }
 
-static long pn544_dev_unlocked_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+static long pn544_dev_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	struct pn544_dev *pn544_dev = filp->private_data;
 
@@ -408,30 +392,26 @@ static long pn544_dev_unlocked_ioctl(struct file *filp, unsigned int cmd, unsign
 			dprintk(PN544_DRV_NAME ":%s power on with firmware\n", __func__);
 
 			gpio_set_value(pn544_dev->ven_gpio, 1);
+                        msleep(20);
 			gpio_set_value(pn544_dev->firm_gpio, 1);
-			msleep(10);
+			msleep(20);
 			gpio_set_value(pn544_dev->ven_gpio, 0);
-			msleep(10);
+			msleep(100);
 			gpio_set_value(pn544_dev->ven_gpio, 1);
-			msleep(10);
+			msleep(20);
 		} else if (arg == 1) {
 			/* power on */
 			dprintk(PN544_DRV_NAME ":%s power on\n", __func__);
 
 			gpio_set_value(pn544_dev->firm_gpio, 0);
 			gpio_set_value(pn544_dev->ven_gpio, 1);
-			msleep(10);
-			// enable irq.
-			irq_set_irq_wake(pn544_dev->client->irq,1);
+			msleep(100);
 		} else  if (arg == 0) {
 			/* power off */
 			dprintk(PN544_DRV_NAME ":%s power off\n", __func__);
 			gpio_set_value(pn544_dev->firm_gpio, 0);
 			gpio_set_value(pn544_dev->ven_gpio, 0);
-			msleep(10);
-
-			// disable irq.
-			irq_set_irq_wake(pn544_dev->client->irq,0);
+			msleep(100);
 
 #ifdef LGE_NFC_READ_IRQ_MODIFY
 		} else if (arg == 3) {//DY_TEST
@@ -477,7 +457,7 @@ static const struct file_operations pn544_dev_fops = {
 	.read	= pn544_dev_read,
 	.write	= pn544_dev_write,
 	.open	= pn544_dev_open,
-	.unlocked_ioctl = pn544_dev_unlocked_ioctl,
+	.unlocked_ioctl = pn544_dev_ioctl,
 };
 
 static int pn544_probe(struct i2c_client *client,
@@ -565,9 +545,9 @@ static int pn544_probe(struct i2c_client *client,
 		dev_err(&client->dev, "request_irq failed\n");
 		goto err_request_irq_failed;
 	}
-//#if !defined(LGE_NFC_HW_QCT_MSM8660)&&!defined(CONFIG_LGE_NFC_HW_QCT_MSM8255)
-//	enable_irq_wake(pn544_get_irq_pin(pn544_dev));
-//#endif
+#if !defined(LGE_NFC_HW_QCT_MSM8660)&&!defined(CONFIG_LGE_NFC_HW_QCT_MSM8255)
+	enable_irq_wake(pn544_get_irq_pin(pn544_dev));
+#endif
 	pn544_disable_irq(pn544_dev);
 	i2c_set_clientdata(client, pn544_dev);
 	dprintk(PN544_DRV_NAME ": pn544_probe() dprintk\n");	
@@ -579,27 +559,20 @@ static int pn544_probe(struct i2c_client *client,
  * 
  * byungchul.park@lge.com 20120328
  */
-//130509 urim.kim@lge.com To know boot mode [START]
-    boot_mode = lge_get_boot_mode();
-    
-	printk("pn544_probe() boot_mode : %d\n",boot_mode);
-    if (boot_mode == LGE_BOOT_MODE_FACTORY || boot_mode == LGE_BOOT_MODE_FACTORY2) {
 #ifdef CONFIG_LGE_NFC_MULTICORE_FASTBOOT
-    	{
-    		struct task_struct *th;
-    		th = kthread_create(pn544_factory_standby_set_thread, NULL, "pn544_factory_standby");
-    		if (IS_ERR(th)) {
-    			ret = PTR_ERR(th);
-    			goto err_request_irq_failed;
-    		}
-    		wake_up_process(th);
-    	}
+	{
+		struct task_struct *th;
+		th = kthread_create(pn544_factory_standby_set_thread, NULL, "pn544_factory_standby");
+		if (IS_ERR(th)) {
+			ret = PTR_ERR(th);
+			goto err_request_irq_failed;
+		}
+		wake_up_process(th);
+	}
 #else
-    	pn544_factory_standby_set();
+	pn544_factory_standby_set();
 #endif
 /* LGE_CHANGE_E */
-    }
-//130509 urim.kim@lge.com To know boot mode [END]
 	return 0;
 
 err_request_irq_failed:
